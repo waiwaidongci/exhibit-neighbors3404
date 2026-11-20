@@ -13,7 +13,8 @@
 3. 分析配置：冻结来源、参数和全部样本，进入Redis队列。
 4. 完整结果：真实算法摘要、专属诊断、全部CSV导出和可恢复失败态。
 5. 策展备选：分析师草案→负责人批准→阅读者下载批准快照。
-6. 审计：登录、来源修改、任务worker完成、业务说明批准等事件。
+6. 误记复核：从已完成研究出发，对指定访客和待查评分找“最少几条一星以内改动会换掉首推”，给出可证下界、方案与独立核对。
+7. 审计：登录、来源修改、任务worker完成、业务说明批准、误记复核发起/续查/完成等事件。
 
 ## 快速启动
 
@@ -57,6 +58,19 @@ Exhibition / VisitorRating / RecommendationRun / CuratorSelection 是核心实�
 
 实体贯穿 `backend/src/models`、`schemas`、`services`、`controllers`、`routes`，以及 `frontend/src/api/research.js`、`stores/research.js` 和 `pages`。`Source.key` 与 `(Record.source_id, reference)` 为自然键；来源改名不会修改已冻结任务输入。业务说明在创建时保存结果快照，批准后从该快照导出。
 
+## 误记复核（反事实搜索）
+
+问题：已有研究某访客的首推展品是 X，哪些已记评分若被误记、且每条最多差一星，会换成别的展品，最少要改几条？
+
+- 口径固定：矩阵、访客、参数全部取自一条**已完成**研究的冻结快照；每条改动为 `r-1` 或 `r+1` 并保持 1–5 分（贴边评分自动落在边界，仍是一条改动）；方案大小即改动条数；首推按“预测值降序、展品代码升序”判定，与生产算法一致。
+- 权威复算：搜索用纯 Python 镜像快速筛选，但任何被判定为“换推”或领先差距小于 `1e-7` 的方案，都用 `services.algorithm.predict` 重新计算后才采纳；页面的“核对结论”也从原研究快照重算基准首推、逐条改动、改后首推与覆盖计数。
+- 不穷举全部组合：先按“单条改动对各展品预测的最大位移”排序待查评分，启发式先尝试低成本方案；穷举按改动条数从 0 递增推进。实际演示数据（240 条评分）核对 0 至 1 条的全部组合（1 + 475 个方案）即可证明 2 条最少或找到 1 条方案。
+- 预算与可证下界：搜索预算按“评估方案数”计（100–5,000,000）。预算用尽即为 `paused`，先显示 `lower_bound`（0 至下界−1 条的全部组合已核对，因此不存在更少改动的方案）、已找到的方案和每层已查计数；只有最小层全部核对完才报“最少”，全部无解报“范围内无方案”。不把已找到的方案谎称为最少。
+- 中断与续查：任务保存 `order`、`cursor`、`checked`、`nodes` 与方案，分块提交；`checked` 与游标同一事务推进，重试只重算未提交的块，不重复计入已查分支。同一研究 + 访客 + 参数 + 待查评分集合的指纹相同即续用同一任务，返回原任务而不新建，保证恢复到同一评分版本。
+- 原研究保留：复核只读取 `run.snapshot`，不改动研究结果、说明或快照；核对失败（例如快照校验和变化使指纹不符）会明确显示“不一致”。
+
+接口：`GET /runs/{id}/counterfactual/options`、`GET|POST /runs/{id}/counterfactual`、`GET /counterfactual/{id}`、`POST /counterfactual/{id}/resume`、`POST /counterfactual/{id}/verify`。worker 使用独立 `counterfactual:queue`。
+
 ## 算法与口径
 
 用户均值中心化相似邻居协同过滤与留一评分RMSE，全部计算位于 `backend/src/services/algorithm.py`，前端不拟合模型、不生成模拟结果。输入是冻结业务观察及参数，输出summary、专属诊断、逐行计算明细、seed与输入SHA256。CSV包含全部结果行；页面仅预览前30行。参数：
@@ -82,12 +96,14 @@ Exhibition / VisitorRating / RecommendationRun / CuratorSelection 是核心实�
 6. 09:25 分析师查看专属诊断及逐行结果，并下载CSV复算。
 7. 09:30 提交“十一月业务复核意见”，负责人核对并批准。
 8. 09:40 viewer下载批准快照，查看审计中的worker完成与批准事件。
+9. 09:50 分析师在“误记复核”选择访客，先以较小预算发起，看到可证下界与已找到方案；预算用尽后点“续查”沿用同一评分版本，证齐后核对结论。
 
 ## 目录与本地开发
 
 ```text
 frontend/src/api, stores, types, components/common, hooks, pages, router, utils, constants
 backend/src/routes, controllers, services, models, schemas, middlewares, utils, constants, config
+backend/tests/test_counterfactual_engine.py, test_counterfactual_api.py
 backend/scripts/seed_demo.py
 backend/migrations/001_initial.sql
 ```
